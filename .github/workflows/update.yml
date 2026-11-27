@@ -1,0 +1,27 @@
+# 毎日決まった時刻に、GitHub 側でデータ更新を実行する（アプリがスリープ中でも動く）。
+# 事前に GitHub の Settings → Secrets and variables → Actions に
+# SUPABASE_URL と SUPABASE_KEY を登録しておく。
+name: daily-update
+
+on:
+  schedule:
+    - cron: "0 21 * * *"       # UTC 21:00 = 日本時間 6:00
+  workflow_dispatch:            # 手動実行ボタン
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "supabase>=2.18" certifi
+      - name: Write connection settings
+        run: |
+          mkdir -p .streamlit
+          printf '[supabase]\nurl = "%s"\nkey = "%s"\n' "$SUPABASE_URL" "$SUPABASE_KEY" > .streamlit/secrets.toml
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      - run: python auto_pick.py
