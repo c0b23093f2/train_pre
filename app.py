@@ -358,6 +358,8 @@ except Exception:
 #   ボタンは無く、次の2つのタイミングで自動的に実行する。
 #     1. アプリが起動したとき（Community Cloud では、スリープから起きたとき・再起動したときも含む）
 #     2. 下の UPDATE_TIMES の時刻になったとき（アプリが起きている間だけ）
+FETCH_JR_FROM_APP = False          # JR東日本は Community Cloud からの接続を拒否する（403）ので、アプリからは取得しない
+                                   #   遅延データは、PC で「python auto_pick.py」を週1回ほど実行して更新する
 UPDATE_TIMES = ["06:00"]           # 毎日この時刻（日本時間）に更新する。["06:00", "18:00"] のように複数も可
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -368,7 +370,7 @@ def _update_once(state, url, key, trigger):
         import auto_pick
         from supabase import create_client
 
-        report = auto_pick.run_update(create_client(url, key))
+        report = auto_pick.run_update(create_client(url, key), include_delay=FETCH_JR_FROM_APP)
     except Exception as error:
         report = [{"name": "データ更新", "ok": False, "message": f"{type(error).__name__}: {str(error)[:150]}"}]
     state.update(
@@ -405,6 +407,8 @@ with st.expander("データの更新状況（自動）", expanded=state["ok"] is
     st.markdown(f"**最後の更新：{state['when']:%m/%d %H:%M}（{state['trigger']}）**\n\n{lines}")
     if state["next"]:
         st.caption(f"次の定時更新：{state['next']:%m/%d %H:%M}（アプリが起きている場合）。起動したときにも自動で更新します。")
+    if not FETCH_JR_FROM_APP:
+        st.caption("遅延データ（JR東日本）は、PC で「python auto_pick.py」を実行したときに更新されます。ここでは気象データだけを自動更新します。")
 
 try:
     data = load_from_supabase(supabase_url, supabase_key, state["version"]).copy()
