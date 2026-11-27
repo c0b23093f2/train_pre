@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -284,70 +286,28 @@ def section_heading(title, anchor_id):
     )
 
 st.markdown('<div id="data-source"></div>', unsafe_allow_html=True)
-
 # ---------------------------------------------------------------------------
-# データの読み込み：すべて自動（CSV のアップロードは不要）
-#   1. 1日1回、JR東日本と気象庁から新しいデータを取得してデータベースに保存する
-#   2. データベース（Supabase）から読み込んで表示する
-#   接続情報は .streamlit/secrets.toml（Community Cloud では Settings → Secrets）。
+# データの読み込み：app.py と同じフォルダーにある CSV を自動で読む（アップロード不要）
 # ---------------------------------------------------------------------------
-LINE_NAME = "中央線快速"
-DB_TO_CSV_DELAY = {          # データベースの列名 → この画面で使う列名
-    "d_start_7": "start_7",
-    "d_7_10": "7_10",
-    "d_10_16": "10_16",
-    "d_16_21": "16_21",
-    "d_21_end": "21_end",
-}
-DB_TO_CSV_WEATHER = {        # データベースの列名 → 気象庁 CSV の項目名
-    "snow_depth": "最深積雪(cm)",
-    "precip_mm": "降水量の合計(mm)",
-    "temp_avg": "平均気温(℃)",
-    "wind_avg": "平均風速(m/s)",
-    "cloud": "平均雲量(10分比)",
-}
-DUMMY_SUFFIX = "（ダミー）"   # テスト用のダミー地点は表示しない
+APP_DIR = Path(__file__).resolve().parent
+CSV_NAMES = ["merged.csv", "merge.csv", "merged (1).csv"]      # 上から順に探す
 
 
-@st.cache_data(ttl=600, show_spinner="データベースから読み込んでいます…")
-def load_from_database(version):
-    """遅延と気象を読み、1日=1行・列は「地点_項目」の表にして返す。
-
-    version は「最後にデータを更新した時刻」。更新されると値が変わり、読み直しになる。
-    """
-    from src import db
-
-    delay = db.load_delay()
-    delay = delay.loc[delay["line"].eq(LINE_NAME)].rename(columns=DB_TO_CSV_DELAY)
-    delay = delay[["date", "line", *DB_TO_CSV_DELAY.values()]]
-
-    weather = db.load_weather()
-    weather = weather.loc[~weather["station"].str.endswith(DUMMY_SUFFIX)]
-    wide = {}
-    for station, rows in weather.groupby("station", sort=False):
-        rows = rows.set_index("date")
-        for db_column, field in DB_TO_CSV_WEATHER.items():
-            if rows[db_column].notna().any():          # 観測していない項目は列を作らない
-                wide[f"{station}_{field}"] = rows[db_column]
-    if not wide:
-        return delay
-    return delay.merge(pd.DataFrame(wide), left_on="date", right_index=True, how="left")
+@st.cache_data(show_spinner=False)
+def load_csv(path, modified_time):
+    """CSV を読む。modified_time はファイルの更新時刻（ファイルを差し替えると読み直す）。"""
+    return pd.read_csv(path, encoding="utf-8-sig")
 
 
-try:
-    import ui_common as ui
-
-    ui.auto_update()                                   # 1日1回だけ実行（失敗しても画面は続ける）
-    update_state = ui.last_update()
-    data = load_from_database(update_state["at"])
-except Exception as error:
-    st.error(f"データベースから読み込めませんでした（{type(error).__name__}: {str(error)[:150]}）。")
+csv_path = next((APP_DIR / name for name in CSV_NAMES if (APP_DIR / name).is_file()), None)
+if csv_path is None:
+    st.error("CSVが見つかりません。app.py と同じフォルダーに「merged.csv」を置いてください。")
     st.stop()
 
-if data.empty:
-    st.error("データベースに中央線快速の遅延データがまだありません。")
-    if update_state["report"]:
-        st.markdown("**自動取得の結果**\n\n" + ui.report_lines(update_state["report"]))
+try:
+    data = load_csv(str(csv_path), csv_path.stat().st_mtime).copy()
+except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as error:
+    st.error(f"CSVを読み込めませんでした: {error}")
     st.stop()
 
 time_columns = {
@@ -363,6 +323,8 @@ weather_fields = {
     "降水量の合計(mm)": ("降水量", "mm"),
     "平均気温(℃)": ("平均気温", "℃"),
     "平均風速(m/s)": ("平均風速", "m/s"),
+    "平均蒸気圧(hPa)": ("平均蒸気圧", "hPa"),
+    "平均雲量(10分比)": ("平均雲量", "10分比"),
 }
 weather_by_location = {}
 for column in data.columns:
@@ -373,13 +335,13 @@ for column in data.columns:
         weather_by_location.setdefault(location, {})[field] = column
 
 if not weather_by_location:
-    st.error("地点別の気象データがありません。「データ管理」画面で気象データを取得してください。")
+    st.error("CSVに対応する地点別の気象データ列がありません。")
     st.stop()
 
 required_columns = {"date", "line", *time_columns.values()}
 missing_columns = sorted(required_columns.difference(data.columns))
 if missing_columns:
-    st.error(f"データに必要な列がありません: {', '.join(missing_columns)}")
+    st.error(f"CSVに必要な列がありません: {', '.join(missing_columns)}")
     st.stop()
 
 data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
@@ -394,7 +356,7 @@ for column in [*time_columns.values(), *(
     data[column] = pd.to_numeric(data[column], errors="coerce")
 
 if data.empty:
-    st.error("有効な中央線快速の遅延データがありません。")
+    st.error("CSVに有効な中央線快速の遅延データがありません。")
     st.stop()
 
 available_dates = sorted(data["date"].unique())
@@ -568,5 +530,5 @@ with st.container(border=True):
 
 st.caption(
     f"データ期間: {min(available_dates):%Y/%m/%d}～{max(available_dates):%Y/%m/%d}。"
-    "データベースの過去実績を表示しています（1日1回、自動で最新のデータを取得します）。将来の予測ではありません。"
+    f"表示しているのは {csv_path.name} の過去実績で、将来の予測やオンラインでの自動取得ではありません。"
 )
