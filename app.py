@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -287,27 +285,74 @@ def section_heading(title, anchor_id):
 
 st.markdown('<div id="data-source"></div>', unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
-# データの読み込み：app.py と同じフォルダーにある CSV を自動で読む（アップロード不要）
+# データの読み込み：Supabase の merged_daily テーブルから自動で読む（アップロード不要）
+#   接続情報は .streamlit/secrets.toml の [supabase] url / key
+#   （Streamlit Community Cloud では、アプリの Settings → Secrets に同じ内容を貼る）
+#   データを入れるのは upload_merged.py（python upload_merged.py）。
 # ---------------------------------------------------------------------------
-APP_DIR = Path(__file__).resolve().parent
-CSV_NAMES = ["merged.csv", "merge.csv", "merged (1).csv"]      # 上から順に探す
+TABLE = "merged_daily"
+DB_DELAY_COLUMNS = {         # テーブルの列名 → この画面で使う列名（merged.csv と同じ）
+    "d_start_7": "start_7",
+    "d_7_10": "7_10",
+    "d_10_16": "10_16",
+    "d_16_21": "16_21",
+    "d_21_end": "21_end",
+    "max_delay": "max_delay",
+    "total_delay": "total_delay",
+}
+DB_STATIONS = {"tokyo": "東京", "hachioji": "八王子", "setagaya": "世田谷", "ome": "青梅"}
+DB_FIELDS = {
+    "snow_cm": "最深積雪(cm)",
+    "precip_mm": "降水量の合計(mm)",
+    "temp_c": "平均気温(℃)",
+    "wind_ms": "平均風速(m/s)",
+    "vapor_hpa": "平均蒸気圧(hPa)",
+    "cloud": "平均雲量(10分比)",
+}
+DB_WEATHER_COLUMNS = {
+    f"{station_id}_{field_id}": f"{station}_{field}"
+    for station_id, station in DB_STATIONS.items()
+    for field_id, field in DB_FIELDS.items()
+}
 
 
-@st.cache_data(show_spinner=False)
-def load_csv(path, modified_time):
-    """CSV を読む。modified_time はファイルの更新時刻（ファイルを差し替えると読み直す）。"""
-    return pd.read_csv(path, encoding="utf-8-sig")
+@st.cache_data(ttl=600, show_spinner="データベースから読み込んでいます…")
+def load_from_supabase(url, key):
+    """merged_daily を全部読み、merged.csv と同じ列名の表にして返す（10分間は結果を使い回す）。"""
+    from supabase import create_client
+
+    client = create_client(url, key)
+    rows, start, page_size = [], 0, 1000          # Supabase は1回で最大1000行なので、分けて読む
+    while True:
+        page = client.table(TABLE).select("*").order("date").range(start, start + page_size - 1).execute().data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
+    frame = pd.DataFrame(rows).rename(columns={**DB_DELAY_COLUMNS, **DB_WEATHER_COLUMNS})
+    weather_names = [name for name in DB_WEATHER_COLUMNS.values() if name in frame.columns]
+    empty = [name for name in weather_names if frame[name].isna().all()]
+    return frame.drop(columns=empty)              # 1件も値が無い項目（観測していない項目）は列ごと外す
 
 
-csv_path = next((APP_DIR / name for name in CSV_NAMES if (APP_DIR / name).is_file()), None)
-if csv_path is None:
-    st.error("CSVが見つかりません。app.py と同じフォルダーに「merged.csv」を置いてください。")
+try:
+    supabase_url = st.secrets["supabase"]["url"]
+    supabase_key = st.secrets["supabase"]["key"]
+except Exception:
+    st.error(
+        "Supabase の接続情報がありません。.streamlit/secrets.toml に [supabase] の url と key を書いてください"
+        "（Community Cloud では Settings → Secrets）。"
+    )
     st.stop()
 
 try:
-    data = load_csv(str(csv_path), csv_path.stat().st_mtime).copy()
-except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as error:
-    st.error(f"CSVを読み込めませんでした: {error}")
+    data = load_from_supabase(supabase_url, supabase_key).copy()
+except Exception as error:
+    st.error(f"データベースから読み込めませんでした（{type(error).__name__}: {str(error)[:150]}）。")
+    st.stop()
+
+if data.empty:
+    st.error("データベースにまだデータがありません。「python upload_merged.py」で merged.csv を入れてください。")
     st.stop()
 
 time_columns = {
@@ -335,13 +380,13 @@ for column in data.columns:
         weather_by_location.setdefault(location, {})[field] = column
 
 if not weather_by_location:
-    st.error("CSVに対応する地点別の気象データ列がありません。")
+    st.error("地点別の気象データがありません。")
     st.stop()
 
 required_columns = {"date", "line", *time_columns.values()}
 missing_columns = sorted(required_columns.difference(data.columns))
 if missing_columns:
-    st.error(f"CSVに必要な列がありません: {', '.join(missing_columns)}")
+    st.error(f"データに必要な列がありません: {', '.join(missing_columns)}")
     st.stop()
 
 data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
@@ -356,7 +401,7 @@ for column in [*time_columns.values(), *(
     data[column] = pd.to_numeric(data[column], errors="coerce")
 
 if data.empty:
-    st.error("CSVに有効な中央線快速の遅延データがありません。")
+    st.error("有効な中央線快速の遅延データがありません。")
     st.stop()
 
 available_dates = sorted(data["date"].unique())
@@ -530,5 +575,5 @@ with st.container(border=True):
 
 st.caption(
     f"データ期間: {min(available_dates):%Y/%m/%d}～{max(available_dates):%Y/%m/%d}。"
-    f"表示しているのは {csv_path.name} の過去実績で、将来の予測やオンラインでの自動取得ではありません。"
+    "表示しているのはデータベース（Supabase）の過去実績で、将来の予測ではありません。"
 )
