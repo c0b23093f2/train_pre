@@ -1,3 +1,8 @@
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -288,7 +293,8 @@ st.markdown('<div id="data-source"></div>', unsafe_allow_html=True)
 # データの読み込み：Supabase の merged_daily テーブルから自動で読む（アップロード不要）
 #   接続情報は .streamlit/secrets.toml の [supabase] url / key
 #   （Streamlit Community Cloud では、アプリの Settings → Secrets に同じ内容を貼る）
-#   データを入れるのは upload_merged.py（python upload_merged.py）。
+#   データの更新は auto_pick.py が行う：1日1回、JR東日本と気象庁から取得して Supabase に保存する。
+#   手元の merged.csv を入れたいときは upload_merged.py（python upload_merged.py）。
 # ---------------------------------------------------------------------------
 TABLE = "merged_daily"
 DB_DELAY_COLUMNS = {         # テーブルの列名 → この画面で使う列名（merged.csv と同じ）
@@ -317,8 +323,11 @@ DB_WEATHER_COLUMNS = {
 
 
 @st.cache_data(ttl=600, show_spinner="データベースから読み込んでいます…")
-def load_from_supabase(url, key):
-    """merged_daily を全部読み、merged.csv と同じ列名の表にして返す（10分間は結果を使い回す）。"""
+def load_from_supabase(url, key, version):
+    """merged_daily を全部読み、merged.csv と同じ列名の表にして返す（10分間は結果を使い回す）。
+
+    version は「これまでに更新した回数」。更新のたびに値が変わり、読み直しになる。
+    """
     from supabase import create_client
 
     client = create_client(url, key)
@@ -345,14 +354,66 @@ except Exception:
     )
     st.stop()
 
+# ---- データの自動更新（JR東日本・気象庁 → Supabase） ---------------------------------
+#   ボタンは無く、次の2つのタイミングで自動的に実行する。
+#     1. アプリが起動したとき（Community Cloud では、スリープから起きたとき・再起動したときも含む）
+#     2. 下の UPDATE_TIMES の時刻になったとき（アプリが起きている間だけ）
+UPDATE_TIMES = ["06:00"]           # 毎日この時刻（日本時間）に更新する。["06:00", "18:00"] のように複数も可
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def _update_once(state, url, key, trigger):
+    """1回ぶんの更新。失敗してもアプリは止めず、結果だけ記録する。"""
+    try:
+        import auto_pick
+        from supabase import create_client
+
+        report = auto_pick.run_update(create_client(url, key))
+    except Exception as error:
+        report = [{"name": "データ更新", "ok": False, "message": f"{type(error).__name__}: {str(error)[:150]}"}]
+    state.update(
+        when=datetime.now(JST), trigger=trigger, report=report,
+        ok=all(step["ok"] for step in report), version=state["version"] + 1,
+    )
+
+
+def _update_loop(state, url, key):
+    """決まった時刻まで待って更新する、を繰り返す（画面とは別に、裏で動き続ける）。"""
+    import auto_pick
+
+    while True:
+        state["next"] = auto_pick.next_run_time(datetime.now(JST), UPDATE_TIMES)
+        time.sleep(max(1.0, (state["next"] - datetime.now(JST)).total_seconds()))
+        _update_once(state, url, key, "定時")
+
+
+@st.cache_resource(show_spinner="起動時のデータ更新をしています…（10〜30秒ほど）")
+def start_auto_update(url, key):
+    """アプリの起動時に1回だけ呼ばれる：まず更新し、そのあと定時更新を裏で始める。"""
+    state = {"when": None, "trigger": None, "ok": None, "report": [], "version": 0, "next": None}
+    _update_once(state, url, key, "起動時")
+    threading.Thread(target=_update_loop, args=(state, url, key), daemon=True).start()
+    return state
+
+
+state = start_auto_update(supabase_url, supabase_key)
+
+with st.expander("データの更新状況（自動）", expanded=state["ok"] is False):
+    lines = "\n\n".join(
+        ("【成功】" if step["ok"] else "【失敗】") + f"{step['name']}：{step['message']}" for step in state["report"]
+    )
+    st.markdown(f"**最後の更新：{state['when']:%m/%d %H:%M}（{state['trigger']}）**\n\n{lines}")
+    if state["next"]:
+        st.caption(f"次の定時更新：{state['next']:%m/%d %H:%M}（アプリが起きている場合）。起動したときにも自動で更新します。")
+
 try:
-    data = load_from_supabase(supabase_url, supabase_key).copy()
+    data = load_from_supabase(supabase_url, supabase_key, state["version"]).copy()
 except Exception as error:
     st.error(f"データベースから読み込めませんでした（{type(error).__name__}: {str(error)[:150]}）。")
     st.stop()
 
 if data.empty:
-    st.error("データベースにまだデータがありません。「python upload_merged.py」で merged.csv を入れてください。")
+    st.error("データベースにまだデータがありません。上の「データの更新状況」の結果を確認してください。")
     st.stop()
 
 time_columns = {
@@ -405,6 +466,12 @@ if data.empty:
     st.stop()
 
 available_dates = sorted(data["date"].unique())
+# 最初に選ぶ日付：気象データまでそろっている最新の日（気象庁の公開は1〜2日遅れるため）
+weather_ready = data.loc[
+    data[[column for fields in weather_by_location.values() for column in fields.values()]].notna().any(axis=1),
+    "date",
+]
+default_date = weather_ready.max() if not weather_ready.empty else available_dates[-1]
 section_heading("過去の実績を確認", "conditions")
 with st.container(border=True):
     date_column, time_column, location_column = st.columns(3)
@@ -413,7 +480,7 @@ with st.container(border=True):
         selected_date = st.selectbox(
             "日付",
             available_dates,
-            index=len(available_dates) - 1,
+            index=available_dates.index(default_date),
             format_func=lambda value: value.strftime("%Y/%m/%d"),
         )
 
@@ -575,5 +642,5 @@ with st.container(border=True):
 
 st.caption(
     f"データ期間: {min(available_dates):%Y/%m/%d}～{max(available_dates):%Y/%m/%d}。"
-    "表示しているのはデータベース（Supabase）の過去実績で、将来の予測ではありません。"
+    "表示しているのはデータベース（Supabase）の過去実績で、将来の予測ではありません。起動時と毎日の決まった時刻に、自動で最新のデータを取得します。"
 )
