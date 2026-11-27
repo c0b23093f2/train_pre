@@ -2,10 +2,8 @@ streamlit>=1.50
 pandas
 altair
 supabase>=2.18
-scikit-learn
-joblib
-plotly
-requests
 certifi
-jpholiday
 tzdata
+scikit-learn==1.9.1
+joblib
+jpholiday

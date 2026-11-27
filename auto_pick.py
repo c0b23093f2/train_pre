@@ -4,8 +4,10 @@
 Community Cloud ではファイルに書いても再起動で消えるので、CSV の代わりにデータベースへ保存する。
 
 使い方
-  - アプリから：app.py が run_update() を呼ぶ（1日1回の自動更新・「いますぐ更新」ボタン）
-  - PC から    ：python auto_pick.py   （.streamlit/secrets.toml の接続情報を使う）
+  - PC から    ：python auto_pick.py   （遅延＋気象を更新。週に1回ほど実行する）
+                 .streamlit/secrets.toml の接続情報を使う
+  - アプリから：app.py が起動時と定時に呼ぶ（気象だけを更新）
+                 Community Cloud からは JR東日本に接続できない（403）ため、遅延は PC から更新する
 
 必要なライブラリ：supabase, certifi（pandas・lxml・requests は使わない）
 
@@ -266,20 +268,25 @@ def update_weather(client, today: date, progress) -> tuple[bool, str]:
     return True, message
 
 
-def run_update(client, today: date | None = None, progress=None) -> list[dict]:
-    """遅延 → 気象の順に更新する。結果を [{"name", "ok", "message"}, ...] で返す。"""
+def run_update(client, today: date | None = None, progress=None, include_delay: bool = True) -> list[dict]:
+    """遅延 → 気象の順に更新する。結果を [{"name", "ok", "message"}, ...] で返す。
+
+    include_delay=False にすると、JR東日本には接続せず、気象だけを更新する
+    （Streamlit Community Cloud からは JR東日本に接続できないため、アプリからはこの形で呼ぶ）。
+    """
     progress = progress or (lambda text: None)
     today = today or datetime.now(ZoneInfo("Asia/Tokyo")).date()
     report = []
 
-    progress("JR東日本：遅延証明書の履歴")
-    try:
-        report.append({"name": "遅延データ（JR東日本）", "ok": True, "message": update_delay(client, today)})
-    except Exception as problem:
-        report.append({
-            "name": "遅延データ（JR東日本）", "ok": False,
-            "message": f"更新に失敗しました（{_short(problem)}）。保存済みのデータはそのままです。",
-        })
+    if include_delay:
+        progress("JR東日本：遅延証明書の履歴")
+        try:
+            report.append({"name": "遅延データ（JR東日本）", "ok": True, "message": update_delay(client, today)})
+        except Exception as problem:
+            report.append({
+                "name": "遅延データ（JR東日本）", "ok": False,
+                "message": f"更新に失敗しました（{_short(problem)}）。保存済みのデータはそのままです。",
+            })
     try:
         ok, message = update_weather(client, today, progress)
     except Exception as problem:
